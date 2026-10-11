@@ -125,10 +125,22 @@ static const struct susfs_import susfs_imports[] = {
     IMP(mutex_lock),
     IMP(mutex_trylock),
     IMP(mutex_unlock),
+    /* With inline spinlocks these names are function-like macros. Taking
+     * &name bypasses macro expansion and imports an out-of-line function the
+     * configured kernel does not build. Match the API selected by its headers;
+     * only out-of-line operations have loader-filled addresses to check. */
+#ifndef _raw_spin_lock
     IMP(_raw_spin_lock),
+#endif
+#ifndef _raw_spin_lock_irqsave
     IMP(_raw_spin_lock_irqsave),
+#endif
+#ifndef _raw_spin_unlock
     IMP(_raw_spin_unlock),
+#endif
+#ifndef _raw_spin_unlock_irqrestore
     IMP(_raw_spin_unlock_irqrestore),
+#endif
     IMP(__rcu_read_lock),
     IMP(__rcu_read_unlock),
     IMP(__put_cred),
