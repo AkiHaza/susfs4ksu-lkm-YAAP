@@ -13,6 +13,7 @@ int ksu_find_symbol_all(const char *name, unsigned long *addrs, int max);
  * (unlike find_kernel_symbol_exact(), which refuses them).  0 = unknown name or no resolver; it
  * does not sleep, so it is usable from atomic context. */
 unsigned long ksu_kallsyms_lookup_name(const char *name);
+int ksu_symbol_name_of(unsigned long addr, char *buf, char **module_out);
 void ksu_init_symbol_resolver(void);
 
 #endif
