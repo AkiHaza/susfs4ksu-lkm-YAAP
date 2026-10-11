@@ -136,6 +136,40 @@ static int ksu_exact_name_cb(void *data, const char *name, struct module *mod, u
     return 1;	/* stop the walk */
 }
 
+/* Same shape as ksu_exact_name_cb(), but it keeps every match (see ksu_find_symbol_all()). */
+struct ksu_all_names_ctx {
+    const char *symbol_name;
+    unsigned long *addrs;
+    int max;
+    int n;
+};
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+static int ksu_all_names_cb(void *data, const char *name, unsigned long addr)
+#else
+static int ksu_all_names_cb(void *data, const char *name, struct module *mod, unsigned long addr)
+#endif
+{
+    struct ksu_all_names_ctx *ctx = data;
+    int i;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+    if (mod)
+        return 0;
+#endif
+
+    if (!name || !addr || strcmp(name, ctx->symbol_name) != 0)
+        return 0;
+
+    for (i = 0; i < ctx->n; i++)
+        if (ctx->addrs[i] == addr)
+            return 0;			/* the walk can report a symbol twice (aliases) */
+
+    if (ctx->n < ctx->max)
+        ctx->addrs[ctx->n++] = addr;
+    return 0;				/* keep walking: uniqueness is not assumed */
+}
+
 unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
 {
     unsigned long addr = 0;
@@ -195,40 +229,6 @@ unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
      * be verified. */
     pr_warn("ignore symbol %s: its owner cannot be checked on this kernel\n", symbol_name);
     return 0;
-}
-
-/* Same shape as ksu_exact_name_cb(), but it keeps every match (see ksu_find_symbol_all()). */
-struct ksu_all_names_ctx {
-    const char *symbol_name;
-    unsigned long *addrs;
-    int max;
-    int n;
-};
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-static int ksu_all_names_cb(void *data, const char *name, unsigned long addr)
-#else
-static int ksu_all_names_cb(void *data, const char *name, struct module *mod, unsigned long addr)
-#endif
-{
-    struct ksu_all_names_ctx *ctx = data;
-    int i;
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
-    if (mod)
-        return 0;
-#endif
-
-    if (!name || !addr || strcmp(name, ctx->symbol_name) != 0)
-        return 0;
-
-    for (i = 0; i < ctx->n; i++)
-        if (ctx->addrs[i] == addr)
-            return 0;			/* the walk can report a symbol twice (aliases) */
-
-    if (ctx->n < ctx->max)
-        ctx->addrs[ctx->n++] = addr;
-    return 0;				/* keep walking: uniqueness is not assumed */
 }
 
 /* Raw name lookup through the bootstrapped kallsyms_lookup_name(), for names the KERNEL does not
@@ -373,6 +373,33 @@ void *ksu_resolve_symbol_for_functable_hook(const char *symbol_name)
 
     return resolve_symbol_variant(symbol_name, symbol_len);
 #endif
+}
+
+/* __nocfi like every other function here that reaches a resolved symbol: the call to
+ * kallsyms_lookup() goes through a function pointer, so an instrumented call site would be
+ * checked against the kernel's type id - and that check panics when it does not match.
+ * 6.12/6.18 reach this through the static-call takeover (lsm_hook.c), i.e. it is on a real
+ * path, not a debug one; tools/cfi_sites.py now fails the build if it is ever un-annotated
+ * again. */
+int __nocfi ksu_symbol_name_of(unsigned long addr, char *buf, char **module_out)
+{
+    char *modname = NULL;
+
+    if (module_out)
+        *module_out = NULL;
+    if (!buf)
+        return -EINVAL;
+    buf[0] = '\0';
+    if (!kallsyms_lookup_fn)
+        return -ENOSYS;
+    if (!addr)
+        return -EINVAL;
+    if (!kallsyms_lookup_fn(addr, NULL, NULL, &modname, buf))
+        return -ENOENT;
+    if (module_out)
+        *module_out = modname;
+
+    return (int)strlen(buf);
 }
 
 void __init ksu_init_symbol_resolver(void)

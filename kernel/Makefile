@@ -42,8 +42,8 @@ ccflags-y += -Wno-declaration-after-statement -Wno-unused-function
 ccflags-y += -I$(srctree)/fs
 
 # SELinux private headers are not needed: the LSM layer reaches SELinux through the live
-# security_hook_heads (see kernel/lsm_hook.c), not through ss/ or flask.h, so the -I lines
-# that used to sit here "for when the feature lands" are gone with it.
+# security_hook_heads / static_calls_table (see kernel/lsm_hook.c), not through ss/ or flask.h,
+# so the -I lines that used to sit here "for when the feature lands" are gone with it.
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 MDIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
