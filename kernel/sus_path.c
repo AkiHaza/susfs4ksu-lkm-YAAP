@@ -7,8 +7,9 @@
  * fs/namei.c (link_path_walk returns -ENOENT; __lookup_slow/lookup_open redo the
  * lookup with the fake qstr "..5.u.S").  This LKM can touch neither - filldir64 is
  * static and LTO-inlined, namei.c is compiled into the kernel - so it reproduces
- * both effects: the getdents64 buffer is rewritten on return (layer 1, by (dev,
- * ino)), and two LSM hooks answer registered inodes with -ENOENT (layer 2:
+ * both effects: the getdents64 buffer is rewritten on return (layer 1, by (ino,
+ * name) - a dirent record carries no dev, see sus_path_is_hidden()), and two LSM
+ * hooks answer registered inodes with -ENOENT (layer 2:
  * inode_getattr for stat/fstatat/statx, inode_permission for
  * open/exec/chmod/truncate/...).
  *
@@ -198,8 +199,9 @@ static inline bool sus_path_is_resolver(void)
  * kern_path("/data/local/tmp/...") comes back -EACCES and the rule stays pending forever
  * (pend: last-rc=-13).  ksu_cred lives in the `kernelsu` module and
  * find_kernel_symbol_exact() deliberately refuses module symbols ("ignore symbol ... of module
- * ..."), so the creds of whoever registered the rule are saved instead - one reference, released on
- * unload - and that process can by definition reach the path. */
+ * ..."), so the creds of whoever registered the rule are saved instead - one reference, released
+ * as soon as the last pending rule is gone (sus_path_maybe_drop_caller_cred()) or on unload - and
+ * that process can by definition reach the path. */
 static const struct cred *sus_path_pending_cred;
 static DEFINE_MUTEX(sus_path_cred_lock);
 static atomic_t sus_path_used_caller_cred = ATOMIC_INIT(0);
@@ -256,6 +258,38 @@ static void sus_path_drop_caller_cred(void)
     mutex_lock(&sus_path_cred_lock);
     old = sus_path_pending_cred;
     sus_path_pending_cred = NULL;
+    mutex_unlock(&sus_path_cred_lock);
+    if (old)
+        put_cred(old);
+}
+
+/* The saved creds are only needed while a rule is still waiting for its walk.  Release them as
+ * soon as the last pending rule is gone - resolved, deleted or cleared - instead of holding one
+ * reference (and with it the registering task's user_ns/ucounts) until the module is unloaded.
+ * A rule that is STILL pending keeps them, because the next retry (or the next add that re-arms
+ * the timer) needs them. */
+static void sus_path_maybe_drop_caller_cred(void)
+{
+    const struct cred *old = NULL;
+
+    if (atomic_read(&sus_path_n_pending))
+        return;
+
+    /* Re-checked under the lock: sus_path_save_caller_cred() takes this same lock, so an add that
+     * registered a pending rule in between has stored its own cred by the time this section runs.
+     * Dropping it there would send the resolver back to walking with the worker's creds - measured
+     * to come back -EACCES under /data, which is why the caller's creds are saved at all.
+     *
+     * One window stays open and heals itself: the list_add and the pending increment happen under
+     * sus_path_lock, while sus_path_save_caller_cred() runs after it, so for a few instructions a
+     * pending rule can exist without creds.  A retry pass that lands exactly there walks once with
+     * the worker's creds (-EACCES, recorded in pend_last_rc), and the next pass one
+     * SUS_PATH_PENDING_RETRY_S later has them; the rule stays pending throughout. */
+    mutex_lock(&sus_path_cred_lock);
+    if (!atomic_read(&sus_path_n_pending)) {
+        old = sus_path_pending_cred;
+        sus_path_pending_cred = NULL;
+    }
     mutex_unlock(&sus_path_cred_lock);
     if (old)
         put_cred(old);
@@ -345,9 +379,18 @@ static bool sus_path_is_hidden(u64 ino, const char *name)
         return false;
 
     /* A dirent is identified by (d_ino, name) and nothing else here - the filter never sees the fd
-     * or the superblock.  A rule whose inode reports 0 has no identity to match, and d_ino 0 is
-     * what some filesystems use for "unknown", so matching it by name alone would hide unrelated
-     * entries; such a rule is hidden by the by-inode layers only (sus_path_supercall()). */
+     * or the superblock, so unlike the LSM layer (the ihold'ed inode pointer, then (dev, i_ino)) it
+     * cannot tell one filesystem from another.  The two layers therefore disagree about one object
+     * in a narrow case: a same-named entry that reuses the same d_ino on ANOTHER filesystem is
+     * dropped from the listing - the rule's dev is not consulted - while its stat/open still work,
+     * because the LSM layer rejects that (dev, i_ino) pair.  The collision is not exotic - most
+     * filesystems number inodes from low values, so a common basename is enough - but the direction
+     * is the safe one: a listing that hides more than the file layer does never leaks a registered
+     * name.  The alternative is not free either: matching the name alone would hide unrelated
+     * entries, which is exactly why the only name-only mode in this file is the explicit opt-in
+     * debug parameter hide_name.  A rule whose inode reports 0 has no identity to match, and
+     * d_ino 0 is what some filesystems use for "unknown", so such a rule is hidden by the
+     * by-inode layers only (sus_path_supercall()). */
     if (ino) {
         spin_lock(&sus_path_lock);
         list_for_each_entry(e, &sus_path_list, list) {
@@ -513,6 +556,10 @@ static int sus_path_resolve_pending(void)
                 resolved, atomic_read(&sus_path_n_pending));
 
     mutex_unlock(&sus_path_pending_lock);
+
+    /* This pass may have resolved the last pending rule, and nothing else will need the
+     * registering process' creds once none is left. */
+    sus_path_maybe_drop_caller_cred();
     return resolved;
 }
 
@@ -1194,7 +1241,16 @@ static void sus_path_hooks_arm(void)
  * the bytes handed back whole, which is still a valid record chain the caller re-reads on its
  * next getdents64; and `count` when nothing was written back, i.e. "nothing was filtered" -
  * the old behaviour returned `count` with a *partially* compacted buffer, telling the caller
- * to parse bytes that were no longer records. */
+ * to parse bytes that were no longer records.
+ *
+ * Filtering only the prefix is not enough: getdents64 hands the caller a length, not a secret,
+ * so a process that ignores that length (or scans the whole buffer for names, which the
+ * module's own test tooling does) would still read a dropped name out of the bytes the chain
+ * no longer covers.  The tail past the compacted chain - and the tail of the placeholder
+ * record's name - is therefore zeroed before returning.  The one path left unscubbed is a
+ * scrub that itself fails (uaccess); it is counted and logged, and the chunk is still handed
+ * back as the compacted chain, so a caller that honours the returned length never parses the
+ * bytes that stayed behind. */
 static long sus_path_filter(unsigned long buf, long count,
                             const struct sus_dirent_layout *lay)
 {
@@ -1202,6 +1258,7 @@ static long sus_path_filter(unsigned long buf, long count,
     long written = 0;       /* bytes of the compacted chain already handed back */
     unsigned short head_reclen = 0;     /* first record's length, for the placeholder */
     bool failed = false;
+    bool counted = false;   /* this chunk was already counted as a rewrite failure */
     char *tmp;
 
     spin_lock(&sus_path_buf_lock);
@@ -1307,6 +1364,7 @@ static long sus_path_filter(unsigned long buf, long count,
 
     if (failed) {
         atomic_inc(&n_dirent_rewrite_fail);
+        counted = true;
         pr_warn_ratelimited("sus_path: dirent rewrite stopped at %ld/%ld bytes (returned %ld)\n",
                             offset, count, written ? written : count);
         if (!written)
@@ -1318,14 +1376,29 @@ static long sus_path_filter(unsigned long buf, long count,
          * chunk.  So one record is left behind as a placeholder - d_ino = 0 with an empty
          * name.  readdir() skips records whose d_ino is 0 (bionic does), which makes the
          * caller ask again; a hand-written parser sees an entry without a name, still better
-         * than a directory that ends early.  The hidden name is gone either way. */
+         * than a directory that ends early. */
     if (!failed && count > 0 && written == 0) {
         char zero_ino[8] = {0};
         char nul = '\0';
 
         /* head_reclen is the first record's own length, read above with this ABI's layout; the
-         * buffer still holds it untouched because written == 0 means nothing was moved. */
+         * buffer still holds it untouched because written == 0 means nothing was moved.  The
+         * placeholder is only d_ino = 0 plus the empty name: everything else the record held
+         * (d_off, d_reclen, d_type and the name's tail - zeroing name[0] alone leaves the rest
+         * of "susfs_kstat" sitting there as "usfs_kstat"), and every record behind it, is
+         * cleared.  The hidden name has to be gone from the buffer, not merely invisible to a
+         * caller that honours the returned length.
+         *
+         * The two scrubs run BEFORE d_ino and name[0] are overwritten, so a failure leaves the
+         * chain itself intact and the `return count` below is honest ("nothing was filtered").
+         * A scrub stopped by a fault can only have zeroed bytes from name[0]'s tail onward -
+         * inside the first record, never its header - so what the caller gets is still a
+         * parseable chain; writing the placeholder first would instead hand it a chain whose
+         * first record is already a placeholder, bytes nothing can parse. */
         if (head_reclen >= lay->name_off + 1 && head_reclen <= count &&
+            !clear_user((void __user *)(buf + lay->name_off + 1),
+                        head_reclen - lay->name_off - 1) &&
+            !clear_user((void __user *)(buf + head_reclen), count - head_reclen) &&
             !copy_to_user((void __user *)buf, zero_ino, lay->ino_size) &&
             !copy_to_user((void __user *)(buf + lay->name_off), &nul, 1)) {
             atomic_inc(&n_dirent_all_hidden);
@@ -1335,6 +1408,23 @@ static long sus_path_filter(unsigned long buf, long count,
          * caller would lose the chunk entirely. */
         atomic_inc(&n_dirent_rewrite_fail);
         return count;
+    }
+
+    /* The dropped records are gone from the chain, but their bytes are still where they used to
+     * be - past `written` - together with the original copy of the records that were moved down.
+     * Whoever ignores the return value, or scans the buffer for names instead of walking it,
+     * reads a hidden name (and its d_ino/d_off) straight out of that tail.  Zero it.  This runs
+     * with the spinlock released and faults enabled, so a tail whose pages are not resident is
+     * still scrubbed rather than left behind.
+     *
+     * A chain that stopped early (failed) leaves just as much of a dropped record behind as a
+     * complete one, so this runs on that path too; the return value stays `written` either way,
+     * because that is what still describes the bytes the caller may parse. */
+    if (written < count && clear_user((void __user *)(buf + written), count - written)) {
+        if (!counted)       /* one failure event, one count */
+            atomic_inc(&n_dirent_rewrite_fail);
+        pr_warn_ratelimited("sus_path: dirent tail scrub stopped at %ld/%ld bytes (%ld bytes of stale records stay in the buffer)\n",
+                            written, count, count - written);
     }
 
     return written;
@@ -1414,6 +1504,9 @@ int sus_path_del_path(const char *path)
     if (removed)
         SUSFS_LOGI("sus_path: removed %d rule(s) for %s, %d left\n", removed, want,
                 sus_path_count);
+    /* A deleted rule cannot resolve later: if it was the last pending one, its caller's creds are
+     * not needed any more. */
+    sus_path_maybe_drop_caller_cred();
     return removed;
 }
 
@@ -1515,6 +1608,9 @@ static int sus_path_command(const char *val, int *removed_out)
             iput(e->inode);
         kfree(e);
     }
+    /* Whatever was removed above is gone for good, `clear` included: if the last pending rule went
+     * with it, the registering process' creds are not needed any more either. */
+    sus_path_maybe_drop_caller_cred();
     SUSFS_LOGI("sus_path: command written, %d rule(s) removed, %d left\n",
             removed, sus_path_count);
     if (removed_out)
@@ -2250,14 +2346,24 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
 
         list_for_each_entry(cur, &sus_path_list, list) {
             /* Same inode: upstream's set_bit() is idempotent.  Same still-unresolved path:
-             * nothing to add but the retry marker. */
+             * nothing to add but the retry marker, which is re-armed below. */
             if ((inode && cur->inode == inode) ||
                 (!inode && !cur->inode && !strcmp(cur->path, e->path))) {
+                /* A duplicate of a rule that is STILL pending is the documented way back from a
+                 * timer that ran out its SUS_PATH_PENDING_TRIES: without the re-arm this add
+                 * reports success and nothing ever tries the walk again, although the comment
+                 * above the loop has always said "the next add re-arms the timer".  `inode` is
+                 * NULL exactly in that case (the other arm of the condition needs it non-NULL).
+                 * The arm's immediate pass re-walks the path this add just failed on - wasted -
+                 * but it also re-tries every other pending rule, which may have become reachable
+                 * since the timer stopped. */
                 spin_unlock(&sus_path_lock);
                 if (e->inode)
                     iput(e->inode);
                 kfree(e);
                 info.err = 0;   /* already registered, upstream is idempotent */
+                if (!inode)
+                    sus_path_pending_arm();
                 goto out;
             }
             /* The rule is there as a pending one and this add is what resolved it: complete that
@@ -2329,6 +2435,11 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
 
     info.err = 0;
 out:
+    /* Every exit above can be the one that took the pending count to zero (a duplicate add that
+     * completed a pending rule, a failed add, a del/clear), and once none is left the resolver
+     * does not need the registering process' creds any more.  Idempotent, so the explicit calls
+     * in del/clear/resolve are harmless. */
+    sus_path_maybe_drop_caller_cred();
     /* upstream writes back only ->err for input-type commands */
     if (copy_to_user(&((struct st_susfs_sus_path __user *)*arg)->err,
                      &info.err, sizeof(info.err)))
