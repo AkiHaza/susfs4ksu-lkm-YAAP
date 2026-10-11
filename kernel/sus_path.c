@@ -1026,6 +1026,19 @@ static void sus_path_hooks_arm(void)
     mutex_unlock(&sus_path_arm_lock);
 }
 
+/* Rewrite the dirent chain the kernel just produced, dropping the entries whose (d_ino, name)
+ * pair is registered; returns the byte count the caller may parse - the compacted length, or
+ * `count` when nothing was filtered.  `lay` selects which ABI's record layout is walked
+ * (linux_dirent64 or the AArch32 compat_linux_dirent).
+ *
+ * Filtering only the prefix is not enough: a listing syscall hands the caller a length, not a
+ * secret, so a process that ignores that length (or scans the whole buffer for names, which the
+ * module's own test tooling does) would still read a dropped name out of the bytes the chain no
+ * longer covers.  The tail past the compacted chain - and the tail of the placeholder record's
+ * name - is therefore zeroed before returning.  The one path left unscubbed is a scrub that
+ * itself fails (uaccess); it is counted and logged, and the chunk is still handed back as the
+ * compacted chain (`written`), so a caller that honours the returned length never parses the
+ * bytes that stayed behind. */
 static long sus_path_filter(unsigned long buf, long count,
                             const struct sus_dirent_layout *lay)
 {
@@ -1033,6 +1046,7 @@ static long sus_path_filter(unsigned long buf, long count,
     long written = 0;       /* bytes of the compacted chain already handed back */
     unsigned short head_reclen = 0;     /* first record's length, for the placeholder */
     bool failed = false;
+    bool counted = false;   /* this chunk was already counted as a rewrite failure */
     char *tmp;
     int id = sus_dirent_l64.id;         /* which ABI's counters to move */
 
@@ -1145,6 +1159,7 @@ static long sus_path_filter(unsigned long buf, long count,
 
     if (failed) {
         atomic_inc(&n_dirent_rewrite_fail);
+        counted = true;
         pr_warn_ratelimited("sus_path: dirent rewrite stopped at %ld/%ld bytes (returned %ld)\n",
                             offset, count, written ? written : count);
         if (!written)
@@ -1155,7 +1170,24 @@ static long sus_path_filter(unsigned long buf, long count,
         char zero_ino[8] = {0};
         char nul = '\0';
 
+        /* head_reclen is the first record's own length, read above with this ABI's layout; the
+         * buffer still holds it untouched because written == 0 means nothing was moved.  The
+         * placeholder is only d_ino = 0 plus the empty name: everything else the record held
+         * (d_off, d_reclen, d_type and the name's tail - zeroing name[0] alone leaves the rest
+         * of "susfs_kstat" sitting there as "usfs_kstat"), and every record behind it, is
+         * cleared.  The hidden name has to be gone from the buffer, not merely invisible to a
+         * caller that honours the returned length.
+         *
+         * The two scrubs run BEFORE d_ino and name[0] are overwritten, so a failure leaves the
+         * chain itself intact and the `return count` below is honest ("nothing was filtered").
+         * A scrub stopped by a fault can only have zeroed bytes from name[0]'s tail onward -
+         * inside the first record, never its header - so what the caller gets is still a
+         * parseable chain; writing the placeholder first would instead hand it a chain whose
+         * first record is already a placeholder, bytes nothing can parse. */
         if (head_reclen >= lay->name_off + 1 && head_reclen <= count &&
+            !clear_user((void __user *)(buf + lay->name_off + 1),
+                        head_reclen - lay->name_off - 1) &&
+            !clear_user((void __user *)(buf + head_reclen), count - head_reclen) &&
             !copy_to_user((void __user *)buf, zero_ino, lay->ino_size) &&
             !copy_to_user((void __user *)(buf + lay->name_off), &nul, 1)) {
             atomic_inc(&n_dirent_all_hidden);
@@ -1164,6 +1196,23 @@ static long sus_path_filter(unsigned long buf, long count,
 
         atomic_inc(&n_dirent_rewrite_fail);
         return count;
+    }
+
+    /* The dropped records are gone from the chain, but their bytes are still where they used to
+     * be - past `written` - together with the original copy of the records that were moved down.
+     * Whoever ignores the return value, or scans the buffer for names instead of walking it,
+     * reads a hidden name (and its d_ino/d_off) straight out of that tail.  Zero it.  This runs
+     * with the spinlock released and faults enabled, so a tail whose pages are not resident is
+     * still scrubbed rather than left behind.
+     *
+     * A chain that stopped early (failed) leaves just as much of a dropped record behind as a
+     * complete one, so this runs on that path too; the return value stays `written` either way,
+     * because that is what still describes the bytes the caller may parse. */
+    if (written < count && clear_user((void __user *)(buf + written), count - written)) {
+        if (!counted)       /* one failure event, one count */
+            atomic_inc(&n_dirent_rewrite_fail);
+        pr_warn_ratelimited("sus_path: dirent tail scrub stopped at %ld/%ld bytes (%ld bytes of stale records stay in the buffer)\n",
+                            written, count, count - written);
     }
 
     return written;
