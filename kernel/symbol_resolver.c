@@ -136,6 +136,40 @@ static int ksu_exact_name_cb(void *data, const char *name, struct module *mod, u
     return 1;	/* stop the walk */
 }
 
+/* Same shape as ksu_exact_name_cb(), but it keeps every match (see ksu_find_symbol_all()). */
+struct ksu_all_names_ctx {
+    const char *symbol_name;
+    unsigned long *addrs;
+    int max;
+    int n;
+};
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+static int ksu_all_names_cb(void *data, const char *name, unsigned long addr)
+#else
+static int ksu_all_names_cb(void *data, const char *name, struct module *mod, unsigned long addr)
+#endif
+{
+    struct ksu_all_names_ctx *ctx = data;
+    int i;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+    if (mod)
+        return 0;
+#endif
+
+    if (!name || !addr || strcmp(name, ctx->symbol_name) != 0)
+        return 0;
+
+    for (i = 0; i < ctx->n; i++)
+        if (ctx->addrs[i] == addr)
+            return 0;			/* the walk can report a symbol twice (aliases) */
+
+    if (ctx->n < ctx->max)
+        ctx->addrs[ctx->n++] = addr;
+    return 0;				/* keep walking: uniqueness is not assumed */
+}
+
 unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
 {
     unsigned long addr = 0;
@@ -195,40 +229,6 @@ unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
      * be verified. */
     pr_warn("ignore symbol %s: its owner cannot be checked on this kernel\n", symbol_name);
     return 0;
-}
-
-/* Same shape as ksu_exact_name_cb(), but it keeps every match (see ksu_find_symbol_all()). */
-struct ksu_all_names_ctx {
-    const char *symbol_name;
-    unsigned long *addrs;
-    int max;
-    int n;
-};
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-static int ksu_all_names_cb(void *data, const char *name, unsigned long addr)
-#else
-static int ksu_all_names_cb(void *data, const char *name, struct module *mod, unsigned long addr)
-#endif
-{
-    struct ksu_all_names_ctx *ctx = data;
-    int i;
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
-    if (mod)
-        return 0;
-#endif
-
-    if (!name || !addr || strcmp(name, ctx->symbol_name) != 0)
-        return 0;
-
-    for (i = 0; i < ctx->n; i++)
-        if (ctx->addrs[i] == addr)
-            return 0;			/* the walk can report a symbol twice (aliases) */
-
-    if (ctx->n < ctx->max)
-        ctx->addrs[ctx->n++] = addr;
-    return 0;				/* keep walking: uniqueness is not assumed */
 }
 
 /* Raw name lookup through the bootstrapped kallsyms_lookup_name(), for names the KERNEL does not

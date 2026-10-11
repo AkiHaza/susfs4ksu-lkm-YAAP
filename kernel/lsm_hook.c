@@ -1306,7 +1306,7 @@ void ksu_lsm_hook_init(void)
      * A disagreement is NOT fatal: the >= 6.12 insert path finds its slot by name and the
      * replace path reports the element offsetof() names next to the one the scan found, so a
      * stride that differs from this build is handled rather than refused - hence pr_warn. */
-    static u32 lsm_max_cnt = 5;
+    static u32 lsm_max_cnt = KSU_LSM_SLOTS_PER_HOOK;
     unsigned long sym_size = sizeof(struct lsm_static_calls_table);
     u32 lsm_active_cnt = 5;
     unsigned long addr = find_kernel_symbol_exact("lsm_active_cnt");

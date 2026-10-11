@@ -42,20 +42,6 @@ int susfs_imports_crosscheck(void);
 /* Add a path to sus_path's hidden set from kernel code (no supercall needed); returns 0 or negative errno. */
 int sus_path_add_hidden(const char *path);
 
-/* The listing filter, driven from the shared sys_exit tracepoint in susfs_kstat.c: which layout a
- * syscall number denotes for a task running the given ABI (-1 when it is not a listing call), and
- * the rewrite itself.  There is no "armed" flag any more: the filter self-gates on no_extra, on
- * the syscall's own return value and on whether any rule exists, so what the caller has to get
- * right is the arguments, not the state.  The stat family in susfs_kstat.c has its own
- * is_compat_task() gate of the same shape; it does not call these. */
-int sus_path_dirent_layout_id(long syscall_nr, bool compat);
-long sus_path_dirent_filter(int lay_id, unsigned long buf, long ret);
-
-/* One line of per-ABI dirent counters for /proc/susfs_kstat: "the callback ran and filtered
- * nothing" has to be distinguishable from "the callback never ran", and the same line names the
- * ABI each count belongs to.  Returns the length written, 0 when the buffer is too small. */
-int sus_path_dirent_stat_line(char *buf, size_t size);
-
 /* Same, for one of this module's own control nodes: flagged so the gate hides it from EVERY non-root caller, not merely
  * from app processes - otherwise a probe running as system (1000) or shell (2000) reads the node name out of /proc. */
 int sus_path_add_self_hidden(const char *path);
@@ -63,6 +49,21 @@ int sus_path_add_self_hidden(const char *path);
 /* Undo sus_path_add_self_hidden(): drops the rule for @path and restores whatever it changed (the relaxed mode, the inode
  * reference); returns the number of rules removed, so 0 means "was not registered".  Process context only (iput). */
 int sus_path_del_path(const char *path);
+
+/* The listing filter, driven from the shared sys_exit tracepoint in susfs_kstat.c: which layout a
+ * syscall number denotes for a task running the given ABI (-1 when it is not a listing call), and
+ * the rewrite itself.  There is no "armed" flag any more: the filter self-gates on no_extra, on
+ * the syscall's own return value and on whether any rule exists, so what the caller has to get
+ * right is the arguments, not the state.  The stat family in susfs_kstat.c has its own
+ * is_compat_task() gate of the same shape; it does not call these. */
+int sus_path_dirent_layout_id(long syscall_nr, bool compat);
+
+long sus_path_dirent_filter(int lay_id, unsigned long buf, long ret);
+
+/* One line of per-ABI dirent counters for /proc/susfs_kstat: "the callback ran and filtered
+ * nothing" has to be distinguishable from "the callback never ran", and the same line names the
+ * ABI each count belongs to.  Returns the length written, 0 when the buffer is too small. */
+int sus_path_dirent_stat_line(char *buf, size_t size);
 
 /* The module's own name: the /sys/module directory and the modinfo name are both the module file name, and the self-hide
  * rules and the /proc/modules filter have to agree with it. */
