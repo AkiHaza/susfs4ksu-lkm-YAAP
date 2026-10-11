@@ -121,8 +121,10 @@ static int fail_layer;
 module_param_named(fail_layer, fail_layer, int, 0644);
 
 /* Not __init/__exit: it is called from both, and an __exit callee in __init code is a
- * modpost section mismatch. */
-static void susfs_layers_down(int upto)
+ * modpost section mismatch. Keep this dispatch out of its callers under LTO so
+ * the artifact CFI gate can identify the checked module-local exit-table call
+ * here, rather than in cleanup_module. The call must retain CFI checking. */
+static noinline void susfs_layers_down(int upto)
 {
     int i;
 
