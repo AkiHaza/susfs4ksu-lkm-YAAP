@@ -43,18 +43,18 @@ int susfs_imports_crosscheck(void);
 int sus_path_add_hidden(const char *path);
 
 /* The listing filter, driven from the shared sys_exit tracepoint in susfs_kstat.c: which layout a
- * syscall number denotes for a task running the given ABI (-1 when it is not a listing call), the
- * rewrite itself, and whether it is armed at all (it is armed on the first rule, and not at all
- * with no_extra).  Split in three so the caller can answer all of that before it touches the
- * arguments.  The stat family in susfs_kstat.c has its own is_compat_task() gate of the same
- * shape; it does not call these. */
-bool sus_path_dirent_armed(void);
+ * syscall number denotes for a task running the given ABI (-1 when it is not a listing call), and
+ * the rewrite itself.  There is no "armed" flag any more: the filter self-gates on no_extra, on
+ * the syscall's own return value and on whether any rule exists, so what the caller has to get
+ * right is the arguments, not the state.  The stat family in susfs_kstat.c has its own
+ * is_compat_task() gate of the same shape; it does not call these. */
 int sus_path_dirent_layout_id(long syscall_nr, bool compat);
 long sus_path_dirent_filter(int lay_id, unsigned long buf, long ret);
 
-/* Whether the shared sys_exit tracepoint (registered by the stat family) is up.  sus_path's
- * listing filter rides it but does not own it, so it needs the answer for its own report. */
-bool susfs_kstat_tracepoint_armed(void);
+/* One line of per-ABI dirent counters for /proc/susfs_kstat: "the callback ran and filtered
+ * nothing" has to be distinguishable from "the callback never ran", and the same line names the
+ * ABI each count belongs to.  Returns the length written, 0 when the buffer is too small. */
+int sus_path_dirent_stat_line(char *buf, size_t size);
 
 /* Same, for one of this module's own control nodes: flagged so the gate hides it from EVERY non-root caller, not merely
  * from app processes - otherwise a probe running as system (1000) or shell (2000) reads the node name out of /proc. */
