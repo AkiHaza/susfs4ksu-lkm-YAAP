@@ -6,6 +6,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/version.h>	/* LINUX_VERSION_CODE: the MODULE_IMPORT_NS spelling below */
 
 #include "symbol_resolver.h"
 #include "susfs_log.h"
@@ -227,6 +228,12 @@ MODULE_LICENSE("GPL");
  * namespace that no kernel ever creates.  (Measured on the built .ko: .modinfo carried
  * no import_ns entry at all.)
  *
+ * v6.13 turned that upside down: "module: Convert symbol namespace to string literal"
+ * (upstream cdd30ebb1b9f, also in the Android common trees) made the macro's argument a
+ * STRING LITERAL, so the old token form now stringifies into "\"VFS_...\"" and the import
+ * is refused.  Both spellings are kept below and chosen by version, so the same source
+ * builds from 5.10 through 6.18.
+ *
  * Note this is necessary but NOT sufficient for plain insmod: nine further symbols we
  * reference are not in the kernel's export table in any of the six supported GKI
  * variants (kallsyms_lookup_name and friends, saved_boot_config, task_work_add, init_mm,
@@ -234,5 +241,9 @@ MODULE_LICENSE("GPL");
  * helper still needs those to be resolved at runtime.  The userspace loader
  * (tools/susfs_insmod.c) sidesteps the whole question by rewriting undefined symbols to
  * absolute addresses, exactly as KernelSU's ksud does - see README. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+#else
 MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+#endif
 MODULE_DESCRIPTION("SUSFS guard LKM (susfs_guard_lkm) v2.3.0-gki");
